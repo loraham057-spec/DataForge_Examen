@@ -1548,11 +1548,14 @@ def evaluation_dashboard():
 
     st.markdown("### 🔍 Vérification des composants")
 
+    # Vérification des composants réellement utilisés par DataForge.
+    # Les anciens modules "Books details" et "Gaaraas resume" ne sont
+    # plus nécessaires dans l'architecture actuelle.
     components = [
         (" Books scraper", BOOKS),
-        (" Books details", BOOKS_DETAILS),
         (" Gaaraas scraper", GAARAAS),
-        ("🔄 Gaaraas resume", GAARAAS_RESUME),
+        ("🧠 Scraper runner", ROOT / "scraper_runner.py"),
+        ("🗄️ Data database", ROOT / "data_database.py"),
     ]
 
     for name, file in components:
