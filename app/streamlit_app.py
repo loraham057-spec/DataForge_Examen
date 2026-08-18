@@ -191,7 +191,7 @@ for _key, _value in {
 
 st.set_page_config(
     page_title="MY DATA COLLECTION APP DATAFORGE",
-    page_icon="📊",
+    page_icon="🕷️",
     layout="wide",
 )
 
@@ -766,7 +766,7 @@ def _show_scraping_result():
     if df is None:
         return
 
-    st.markdown("### 📊 Résultats du scraping")
+    st.markdown("### 🕷️ Résultats du scraping")
 
     c1, c2 = st.columns(2)
     c1.metric("Lignes collectées", f"{len(df):,}")
@@ -969,7 +969,7 @@ def books_dashboard():
     if df is None:
         return
 
-    st.markdown("## 📚 Books to Scrape")
+    st.markdown("##  Books to Scrape")
     st.markdown('<div class="df-line"></div>', unsafe_allow_html=True)
 
     books_filter_version = int(
@@ -1116,7 +1116,7 @@ def books_dashboard():
 
     a, b, c, d = st.columns(4)
 
-    a.metric("📚 Livres", f"{len(filtered):,}")
+    a.metric(" Livres", f"{len(filtered):,}")
     b.metric(
         "💷 Prix moyen",
         f"£{price.mean():.2f}"
@@ -1140,7 +1140,7 @@ def books_dashboard():
     # GRAPHIQUE
     # ---------------------------
     if "category" in filtered and not filtered.empty:
-        st.markdown("### 📊 Livres par catégorie")
+        st.markdown("### 🕷️ Livres par catégorie")
         st.bar_chart(
             filtered["category"]
             .value_counts()
@@ -1172,7 +1172,7 @@ def gaaraas_dashboard():
     if df is None:
         return
 
-    st.markdown("## 🚗 Gaaraas")
+    st.markdown("##  Gaaraas")
     st.markdown('<div class="df-line"></div>', unsafe_allow_html=True)
 
     gaaraas_filter_version = int(
@@ -1364,7 +1364,7 @@ def gaaraas_dashboard():
 
     a, b, c, d = st.columns(4)
 
-    a.metric("🚗 Annonces", f"{len(filtered):,}")
+    a.metric(" Annonces", f"{len(filtered):,}")
     b.metric(
         "💰 Prix moyen",
         f"{price.mean():,.0f} XOF"
@@ -1388,7 +1388,7 @@ def gaaraas_dashboard():
     # GRAPHIQUES
     # ---------------------------
     if "brand" in filtered and not filtered.empty:
-        st.markdown("### 📊 Annonces par marque")
+        st.markdown("### 🕷️ Annonces par marque")
         st.bar_chart(
             filtered["brand"]
             .value_counts()
@@ -1451,8 +1451,8 @@ def sql_dashboard():
 
     a, b, c = st.columns(3)
 
-    a.metric("📚 Books", f"{table_count(ROOT, 'books'):,}")
-    b.metric("🚗 Gaaraas", f"{table_count(ROOT, 'gaaraas'):,}")
+    a.metric(" Books", f"{table_count(ROOT, 'books'):,}")
+    b.metric(" Gaaraas", f"{table_count(ROOT, 'gaaraas'):,}")
     c.metric("🗄️ Tables", len(tables))
 
     if tables:
@@ -1549,9 +1549,9 @@ def evaluation_dashboard():
     st.markdown("### 🔍 Vérification des composants")
 
     components = [
-        ("📚 Books scraper", BOOKS),
-        ("📚 Books details", BOOKS_DETAILS),
-        ("🚗 Gaaraas scraper", GAARAAS),
+        (" Books scraper", BOOKS),
+        (" Books details", BOOKS_DETAILS),
+        (" Gaaraas scraper", GAARAAS),
         ("🔄 Gaaraas resume", GAARAAS_RESUME),
     ]
 
@@ -1568,15 +1568,15 @@ def evaluation_dashboard():
 # prévues dans le projet.
 # ============================================================
 
-st.sidebar.title("📊 DATAFORGE")
+st.sidebar.title("🕷️ DATAFORGE")
 st.sidebar.caption(f"📍 {st.session_state.df_location}")
 st.sidebar.caption("Data Collection")
 
 source = st.sidebar.selectbox(
     "Source de données",
     [
-        "📚 Books to Scrape",
-        "🚗 Gaaraas",
+        " Books to Scrape",
+        " Gaaraas",
     ],
 )
 
@@ -1593,7 +1593,7 @@ mode = st.sidebar.selectbox(
     [
         "🚀 Scrape data",
         "⬇️ Download scraped data",
-        "📊 Dashboard of the data",
+        "🕷️ Dashboard of the data",
         "🗄️ SQL Database",
         "🧪 Evaluate the App",
     ],
@@ -1673,7 +1673,7 @@ if st.sidebar.button(
 st.markdown(
     f"""
     <div class="df-title">
-        📊 MY DATA COLLECTION APP DATAFORGE
+        🕷️ MY DATA COLLECTION APP DATAFORGE
     </div>
     <div class="df-subtitle">
         {CURRENT_SUBTITLE}
@@ -1711,7 +1711,7 @@ if mode == "🚀 Scrape data":
             use_container_width=True,
             key="start_scraping_button",
         ):
-            if source.startswith("📚"):
+            if source.startswith(""):
                 _start_scraping("books", int(pages))
             else:
                 _start_scraping("gaaraas", int(pages))
@@ -1733,7 +1733,7 @@ elif mode == "⬇️ Download scraped data":
 
     download_files(
         BOOK_FILES
-        if source.startswith("📚")
+        if source.startswith("")
         else GAARAAS_FILES
     )
 
@@ -1742,8 +1742,8 @@ elif mode == "⬇️ Download scraped data":
 # Description : visualisation des données nettoyées.
 # ============================================================
 
-elif mode == "📊 Dashboard of the data":
-    if source.startswith("📚"):
+elif mode == "🕷️ Dashboard of the data":
+    if source.startswith(""):
         books_dashboard()
     else:
         gaaraas_dashboard()
