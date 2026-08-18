@@ -28,7 +28,6 @@ import os
 import sys
 import subprocess
 import json
-import time
 from pathlib import Path
 
 import pandas as pd
@@ -44,6 +43,9 @@ ROOT = Path(__file__).resolve().parent.parent
 APP_DIR = ROOT / "app"
 SCRAPING = ROOT / "scraping"
 CLEANED = ROOT / "data" / "cleaned"
+TEMP = ROOT / "data" / "temp"
+JOB_FILE = TEMP / "dataforge_scraping_job.json"
+RUNNER = ROOT / "scraper_runner.py"
 
 if str(APP_DIR) not in sys.path:
     sys.path.insert(0, str(APP_DIR))
@@ -66,15 +68,26 @@ from data_database import (
 
 init_database(ROOT)
 
+# Compatibilité avec la couche SQL existante : certaines versions de
+# data_database.py ne fournissent pas database_size(). On calcule donc
+# directement la taille du fichier SQLite sans modifier cette couche.
+def database_size(root):
+    try:
+        db_path = Path(database_path(root))
+        return db_path.stat().st_size if db_path.exists() else 0
+    except Exception:
+        return 0
+
 # ============================================================
 # 3. SCRIPTS SELENIUM
 # Description : références vers les scripts existants du projet.
 # ============================================================
 
 BOOKS = SCRAPING / "books_scraper.py"
+BOOKS_DETAILS = SCRAPING / "complete_books_details.py"
+
 GAARAAS = SCRAPING / "gaaraas_full_scraper.py"
-RUNNER = ROOT / "scraper_runner.py"
-JOB_STATE = ROOT / "data" / "temp" / "dataforge_scraping_job.json"
+GAARAAS_RESUME = SCRAPING / "gaaraas_resume_scraper.py"
 
 # ============================================================
 # 4. DATASETS
@@ -147,9 +160,9 @@ LOCATIONS = [
 
 KOBO_DEFAULT = "https://ee.kobotoolbox.org/x/1oNIZ8OJ"
 GOOGLE_DEFAULT = (
-    "https://docs.google.com/forms/d/e/"
-    "1FAIpQLScFmWJm7vxf0UYLhoVVr1V4UBpOADke6rzt1CrV4rgnFE2Wmg/"
-    "viewform?usp=header"
+    "https://docs.google.com/forms/d/"
+    "12chzH8GCz0kHlUBhdnm11SnY0_cvW_aDvCHhjqQvC-g/"
+    "viewform"
 )
 
 for _key, _value in {
@@ -172,7 +185,7 @@ for _key, _value in {
 
 st.set_page_config(
     page_title="MY DATA COLLECTION APP DATAFORGE",
-    page_icon="🕷️",
+    page_icon="📊",
     layout="wide",
 )
 
@@ -502,148 +515,313 @@ def read_csv(path):
         return None
 
 
+
 # ============================================================
-# 8. EXÉCUTION SELENIUM
-# Description : exécute un script de scraping et affiche ses logs.
+# 8. SCRAPING EN ARRIÈRE-PLAN
 # ============================================================
 
-def _database_size(root):
-    """Retourne la taille de la base SQLite en octets."""
-    db = root / "data" / "database" / "data_collection.db"
-    return db.stat().st_size if db.exists() else 0
-
-
-def _read_job_state():
-    """Lit l'état persistant du scraper sans dépendre de la page Streamlit."""
-    if not JOB_STATE.exists():
+def _read_job():
+    if not JOB_FILE.exists():
         return None
     try:
-        return json.loads(JOB_STATE.read_text(encoding="utf-8"))
+        return json.loads(JOB_FILE.read_text(encoding="utf-8"))
     except Exception:
         return None
 
 
+def _write_job(**values):
+    TEMP.mkdir(parents=True, exist_ok=True)
+    current = _read_job() or {}
+    current.update(values)
+    JOB_FILE.write_text(
+        json.dumps(current, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+
+
+def _process_is_running(pid):
+    if not pid:
+        return False
+    try:
+        pid = int(pid)
+    except (TypeError, ValueError):
+        return False
+
+    try:
+        import ctypes
+        handle = ctypes.windll.kernel32.OpenProcess(
+            0x1000, False, pid
+        )
+        if handle:
+            ctypes.windll.kernel32.CloseHandle(handle)
+            return True
+    except Exception:
+        pass
+
+    return False
+
+
+def _scraping_running():
+    state = _read_job()
+    if not state:
+        return False
+    if state.get("status") not in {"starting", "running"}:
+        return False
+    return _process_is_running(state.get("pid"))
+
+
 def _start_scraping(dataset, pages):
-    """Lance le scraper dans un processus indépendant de Streamlit."""
     if not RUNNER.exists():
         st.error(f"❌ Runner introuvable : {RUNNER}")
         return False
 
-    state = _read_job_state() or {}
-    if state.get("status") in {"starting", "running"}:
+    pages = int(pages)
+
+    if pages < 1:
+        st.error("❌ Le nombre de pages doit être au moins 1.")
+        return False
+
+    if _scraping_running():
         st.warning("⏳ Un scraping est déjà en cours.")
         return False
 
-    JOB_STATE.parent.mkdir(parents=True, exist_ok=True)
+    TEMP.mkdir(parents=True, exist_ok=True)
+
+    _write_job(
+        dataset=dataset,
+        status="starting",
+        stage="initialisation",
+        pages=pages,
+        current_page=0,
+        total_pages=pages,
+        progress=0,
+        message=f"Démarrage {dataset} : {pages} page(s).",
+        output=None,
+        error=None,
+        pid=None,
+    )
+
     env = os.environ.copy()
     env["PYTHONIOENCODING"] = "utf-8"
     env["PYTHONUTF8"] = "1"
 
+    log_path = TEMP / "dataforge_scraping.log"
+
     try:
-        subprocess.Popen(
-            [sys.executable, str(RUNNER), dataset, str(int(pages)), str(ROOT)],
-            cwd=str(ROOT),
-            env=env,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            creationflags=getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0),
+        log = open(
+            log_path,
+            "a",
+            encoding="utf-8",
+            errors="replace",
         )
-        return True
+
+        process = subprocess.Popen(
+            [
+                sys.executable,
+                str(RUNNER),
+                dataset,
+                str(pages),
+                str(ROOT),
+            ],
+            cwd=str(ROOT),
+            stdin=subprocess.DEVNULL,
+            stdout=log,
+            stderr=subprocess.STDOUT,
+            env=env,
+            creationflags=getattr(
+                subprocess,
+                "CREATE_NEW_PROCESS_GROUP",
+                0,
+            ),
+        )
+
+        log.close()
+
     except Exception as exc:
-        st.error(f"❌ Impossible de démarrer le scraping : {exc}")
+        try:
+            log.close()
+        except Exception:
+            pass
+
+        _write_job(
+            status="failed",
+            stage="error",
+            error=str(exc),
+            message="Impossible de démarrer le scraping.",
+        )
+        st.error(f"❌ Erreur de démarrage : {exc}")
         return False
 
+    _write_job(
+        pid=process.pid,
+        status="running",
+        stage="initialisation",
+        progress=0,
+        message=f"Scraping {dataset} lancé pour {pages} page(s).",
+    )
 
-def _show_scraping_progress():
-    """Affiche l'état du job. Le processus continue même si l'utilisateur navigue."""
-    state = _read_job_state()
+    st.success(
+        f"🚀 Scraping {dataset.title()} lancé."
+    )
+    st.info(
+        "Le scraping continue en arrière-plan. "
+        "Vous pouvez changer de page dans DataForge sans "
+        "interrompre l'extraction."
+    )
+    return True
+
+
+def _refresh_scraping():
+    state = _read_job()
+    if not state or state.get("status") not in {"starting", "running"}:
+        return
+
+    try:
+        from streamlit_autorefresh import st_autorefresh
+        st_autorefresh(
+            interval=1000,
+            key="dataforge_scraping_refresh",
+        )
+    except ImportError:
+        return
+
+
+def _render_scraping_status():
+    state = _read_job()
     if not state:
         return
 
-    status = state.get("status", "unknown")
-    current = int(state.get("current_page", 0) or 0)
-    total = int(state.get("total_pages", state.get("pages", 1)) or 1)
-    total = max(total, 1)
-    progress = min(max(current / total, 0.0), 1.0)
-    dataset = state.get("dataset", "").upper()
+    status = state.get("status", "")
+    dataset = state.get("dataset", "")
+    pages = int(
+        state.get("total_pages", state.get("pages", 0)) or 0
+    )
+    current_page = int(state.get("current_page", 0) or 0)
+    progress = max(
+        0,
+        min(100, int(state.get("progress", 0) or 0)),
+    )
     message = state.get("message", "")
 
     if status in {"starting", "running"}:
-        st.info(f"🔄 Scraping {dataset} en cours — {message}")
-        st.progress(progress, text=f"Page {current}/{total} — {progress:.0%}")
-        st.caption("Vous pouvez changer de page dans DataForge : le scraping continue en arrière-plan.")
+        st.markdown("### 🔄 Scraping en cours")
+
+        c1, c2, c3 = st.columns(3)
+        c1.metric("Source", dataset.title())
+        c2.metric("Progression", f"{progress}%")
+        c3.metric("Pages", f"{current_page}/{pages}")
+
+        st.progress(progress / 100)
+
+        if message:
+            st.caption(message)
+
+        st.info(
+            "⏳ Le scraping tourne indépendamment de cette page."
+        )
+
     elif status == "completed":
-        st.success(f"✅ Scraping {dataset} terminé — {message}")
-        st.progress(1.0, text=f"Terminé — {total}/{total} pages")
+        st.success(
+            f"✅ Scraping {dataset.title()} terminé."
+        )
+        if message:
+            st.caption(message)
 
-        # Synchronisation SQLite une seule fois après la fin du job.
-        if not state.get("sql_synced"):
-            output_value = state.get("output")
-            if output_value:
-                output_path = Path(output_value)
-                if output_path.exists():
-                    try:
-                        count = sync_dataset(ROOT, dataset.lower(), output_path)
-                        # Le fichier d'état est réécrit pour éviter une synchronisation répétée.
-                        state["sql_synced"] = True
-                        state["sql_rows"] = count
-                        JOB_STATE.write_text(
-                            json.dumps(state, ensure_ascii=False, indent=2),
-                            encoding="utf-8",
-                        )
-                        st.success(f"🗄️ SQLite synchronisée : {count:,} lignes.")
-                    except Exception as exc:
-                        st.warning(f"⚠️ CSV disponible mais synchronisation SQLite impossible : {exc}")
-
-        # Aperçu immédiat du résultat final.
-        output_value = state.get("output")
-        if output_value and Path(output_value).exists():
-            try:
-                result_df = pd.read_csv(output_value)
-                st.caption(f"🕷️ Résultat : {len(result_df):,} lignes")
-                st.dataframe(result_df.head(20), use_container_width=True, hide_index=True)
-                c1, c2 = st.columns(2)
-                csv_bytes = result_df.to_csv(index=False).encode("utf-8-sig")
-                with c1:
-                    st.download_button(
-                        "⬇️ Télécharger CSV", csv_bytes,
-                        file_name=Path(output_value).name,
-                        mime="text/csv",
-                        use_container_width=True,
-                    )
-                with c2:
-                    import io
-                    buffer = io.BytesIO()
-                    with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
-                        result_df.to_excel(writer, index=False, sheet_name=dataset.title())
-                    st.download_button(
-                        "📗 Télécharger Excel", buffer.getvalue(),
-                        file_name=Path(output_value).with_suffix(".xlsx").name,
-                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                        use_container_width=True,
-                    )
-            except Exception as exc:
-                st.warning(f"⚠️ Impossible d'afficher le résultat final : {exc}")
     elif status == "failed":
-        st.error(f"❌ Scraping {dataset} échoué : {state.get('error', message)}")
+        st.error(
+            f"❌ Scraping {dataset.title()} échoué."
+        )
+        if state.get("error"):
+            st.code(str(state["error"]), language="text")
 
 
-@st.fragment(run_every=1)
-def _scraping_monitor():
-    """Rafraîchit la progression sans bloquer Streamlit."""
-    _show_scraping_progress()
+def _scraping_output():
+    state = _read_job()
+    if not state or state.get("status") != "completed":
+        return None
+
+    output = state.get("output")
+    if not output:
+        return None
+
+    path = Path(output)
+    return path if path.exists() else None
 
 
-# ============================================================
-# 9. SCRAPING
-# ============================================================
+def _show_scraping_result():
+    output = _scraping_output()
+    if not output:
+        return
 
-def scrape_books(pages):
-    return _start_scraping("books", pages)
+    state = _read_job() or {}
+    dataset = state.get("dataset", "")
 
+    df = read_csv(output)
+    if df is None:
+        return
 
-def scrape_gaaraas(pages):
-    return _start_scraping("gaaraas", pages)
+    st.markdown("### 📊 Résultats du scraping")
+
+    c1, c2 = st.columns(2)
+    c1.metric("Lignes collectées", f"{len(df):,}")
+    c2.metric(
+        "Pages demandées",
+        f"{state.get('total_pages', state.get('pages', 0))}",
+    )
+
+    st.success(f"📄 {output.name} disponible.")
+
+    st.dataframe(
+        df,
+        use_container_width=True,
+        height=440,
+        hide_index=True,
+    )
+
+    st.download_button(
+        "⬇️ Télécharger CSV",
+        df.to_csv(index=False).encode("utf-8-sig"),
+        file_name=output.name,
+        mime="text/csv",
+        key=(
+            f"scraping_csv_{dataset}_"
+            f"{output.stat().st_mtime_ns}"
+        ),
+        use_container_width=True,
+    )
+
+    try:
+        import io
+
+        buffer = io.BytesIO()
+
+        with pd.ExcelWriter(
+            buffer,
+            engine="openpyxl",
+        ) as writer:
+            df.to_excel(
+                writer,
+                index=False,
+                sheet_name=dataset[:31] or "Data",
+            )
+
+        st.download_button(
+            "📗 Télécharger Excel",
+            buffer.getvalue(),
+            file_name=output.stem + ".xlsx",
+            mime=(
+                "application/vnd.openxmlformats-officedocument."
+                "spreadsheetml.sheet"
+            ),
+            key=(
+                f"scraping_excel_{dataset}_"
+                f"{output.stat().st_mtime_ns}"
+            ),
+            use_container_width=True,
+        )
+
+    except Exception as exc:
+        st.warning(f"Excel indisponible : {exc}")
 
 
 # ============================================================
@@ -785,7 +963,7 @@ def books_dashboard():
     if df is None:
         return
 
-    st.markdown("##  Books to Scrape")
+    st.markdown("## 📚 Books to Scrape")
     st.markdown('<div class="df-line"></div>', unsafe_allow_html=True)
 
     books_filter_version = int(
@@ -932,7 +1110,7 @@ def books_dashboard():
 
     a, b, c, d = st.columns(4)
 
-    a.metric(" Livres", f"{len(filtered):,}")
+    a.metric("📚 Livres", f"{len(filtered):,}")
     b.metric(
         "💷 Prix moyen",
         f"£{price.mean():.2f}"
@@ -956,7 +1134,7 @@ def books_dashboard():
     # GRAPHIQUE
     # ---------------------------
     if "category" in filtered and not filtered.empty:
-        st.markdown("### 🕷️ Livres par catégorie")
+        st.markdown("### 📊 Livres par catégorie")
         st.bar_chart(
             filtered["category"]
             .value_counts()
@@ -988,7 +1166,7 @@ def gaaraas_dashboard():
     if df is None:
         return
 
-    st.markdown("##  Gaaraas")
+    st.markdown("## 🚗 Gaaraas")
     st.markdown('<div class="df-line"></div>', unsafe_allow_html=True)
 
     gaaraas_filter_version = int(
@@ -1180,7 +1358,7 @@ def gaaraas_dashboard():
 
     a, b, c, d = st.columns(4)
 
-    a.metric(" Annonces", f"{len(filtered):,}")
+    a.metric("🚗 Annonces", f"{len(filtered):,}")
     b.metric(
         "💰 Prix moyen",
         f"{price.mean():,.0f} XOF"
@@ -1204,7 +1382,7 @@ def gaaraas_dashboard():
     # GRAPHIQUES
     # ---------------------------
     if "brand" in filtered and not filtered.empty:
-        st.markdown("### 🕷️ Annonces par marque")
+        st.markdown("### 📊 Annonces par marque")
         st.bar_chart(
             filtered["brand"]
             .value_counts()
@@ -1260,15 +1438,15 @@ def sql_dashboard():
 
     st.info(
         f"Base : `{database_path(ROOT)}` • "
-        f"Taille : {_database_size(ROOT) / 1024:.1f} KB"
+        f"Taille : {database_size(ROOT) / 1024:.1f} KB"
     )
 
     tables = list_tables(ROOT)
 
     a, b, c = st.columns(3)
 
-    a.metric(" Books", f"{table_count(ROOT, 'books'):,}")
-    b.metric(" Gaaraas", f"{table_count(ROOT, 'gaaraas'):,}")
+    a.metric("📚 Books", f"{table_count(ROOT, 'books'):,}")
+    b.metric("🚗 Gaaraas", f"{table_count(ROOT, 'gaaraas'):,}")
     c.metric("🗄️ Tables", len(tables))
 
     if tables:
@@ -1365,18 +1543,17 @@ def evaluation_dashboard():
     st.markdown("### 🔍 Vérification des composants")
 
     components = [
-        (" Books scraper", BOOKS, "required"),
-        (" Gaaraas scraper", GAARAAS, "required"),
-        ("⚙️ Scraper runner", RUNNER, "required"),
+        ("📚 Books scraper", BOOKS),
+        ("📚 Books details", BOOKS_DETAILS),
+        ("🚗 Gaaraas scraper", GAARAAS),
+        ("🔄 Gaaraas resume", GAARAAS_RESUME),
     ]
 
-    for name, file, level in components:
+    for name, file in components:
         if file.exists():
             st.success(f"✅ {name} : disponible")
         else:
             st.error(f"❌ {name} : introuvable")
-
-    st.info("ℹ️ La récupération des détails Books est intégrée au nouveau scraper ; aucun fichier `complete_books_details.py` séparé n'est requis.")
 
 
 # ============================================================
@@ -1385,15 +1562,15 @@ def evaluation_dashboard():
 # prévues dans le projet.
 # ============================================================
 
-st.sidebar.title("🕷️ DATAFORGE")
+st.sidebar.title("📊 DATAFORGE")
 st.sidebar.caption(f"📍 {st.session_state.df_location}")
 st.sidebar.caption("Data Collection")
 
 source = st.sidebar.selectbox(
     "Source de données",
     [
-        " Books to Scrape",
-        " Gaaraas",
+        "📚 Books to Scrape",
+        "🚗 Gaaraas",
     ],
 )
 
@@ -1401,7 +1578,7 @@ pages = st.sidebar.number_input(
     "Pages à traiter",
     min_value=1,
     max_value=100,
-    value=50 if source.startswith("") else 13,
+    value=1,
     step=1,
 )
 
@@ -1410,7 +1587,7 @@ mode = st.sidebar.selectbox(
     [
         "🚀 Scrape data",
         "⬇️ Download scraped data",
-        "🕷️ Dashboard of the data",
+        "📊 Dashboard of the data",
         "🗄️ SQL Database",
         "🧪 Evaluate the App",
     ],
@@ -1490,7 +1667,7 @@ if st.sidebar.button(
 st.markdown(
     f"""
     <div class="df-title">
-        🕷️ MY DATA COLLECTION APP DATAFORGE
+        📊 MY DATA COLLECTION APP DATAFORGE
     </div>
     <div class="df-subtitle">
         {CURRENT_SUBTITLE}
@@ -1513,32 +1690,32 @@ if mode == "🚀 Scrape data":
         f"Pages à traiter : **{pages}**"
     )
 
-    state = _read_job_state() or {}
-    running = state.get("status") in {"starting", "running"}
+    st.caption(
+        "Le nombre de pages est réellement transmis au scraper. "
+        "1 page = page 1 uniquement."
+    )
 
-    if running:
-        _show_scraping_progress()
-    else:
+    _refresh_scraping()
+    _render_scraping_status()
+
+    if not _scraping_running():
         if st.button(
             "🚀 START SCRAPING",
             type="primary",
             use_container_width=True,
+            key="start_scraping_button",
         ):
-            started = (
-                scrape_books(pages)
-                if source.startswith("")
-                else scrape_gaaraas(pages)
-            )
-            if started:
-                st.success("🚀 Scraping lancé en arrière-plan.")
-                st.rerun()
+            if source.startswith("📚"):
+                _start_scraping("books", int(pages))
+            else:
+                _start_scraping("gaaraas", int(pages))
+    else:
+        st.warning(
+            "⏳ Un scraping est déjà en cours. "
+            "Vous pouvez naviguer dans l'application."
+        )
 
-    # Affichage de l'état persistant. Le runner continue même si
-    # l'utilisateur sélectionne une autre fonctionnalité.
-    try:
-        _scraping_monitor()
-    except Exception:
-        pass
+    _show_scraping_result()
 
 # ============================================================
 # 20. DOWNLOAD
@@ -1550,7 +1727,7 @@ elif mode == "⬇️ Download scraped data":
 
     download_files(
         BOOK_FILES
-        if source.startswith("")
+        if source.startswith("📚")
         else GAARAAS_FILES
     )
 
@@ -1559,8 +1736,8 @@ elif mode == "⬇️ Download scraped data":
 # Description : visualisation des données nettoyées.
 # ============================================================
 
-elif mode == "🕷️ Dashboard of the data":
-    if source.startswith(""):
+elif mode == "📊 Dashboard of the data":
+    if source.startswith("📚"):
         books_dashboard()
     else:
         gaaraas_dashboard()
@@ -1581,3 +1758,584 @@ elif mode == "🗄️ SQL Database":
 else:
     evaluation_dashboard()
 
+# ============================================================
+# DATAFORGE — SCRAPER RUNNER
+# ============================================================
+# Fonctionnalités :
+# - Respect réel du nombre de pages demandé
+# - Books : START_PAGE / END_PAGE
+# - Gaaraas : START_PAGE / END_PAGE
+# - Exécution en arrière-plan
+# - État persistant dans data/temp/
+# - Aucun affichage des logs Selenium dans Streamlit
+# - Compatible Python 3.12
+# ============================================================
+
+import importlib.util
+import json
+import os
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+
+# ============================================================
+# CHARGEMENT DYNAMIQUE D'UN SCRAPER
+# ============================================================
+
+def load_module(path: Path):
+
+    if not path.exists():
+        raise FileNotFoundError(
+            f"Script introuvable : {path}"
+        )
+
+    module_name = (
+        f"dataforge_scraper_{path.stem}"
+    )
+
+    spec = importlib.util.spec_from_file_location(
+        module_name,
+        path,
+    )
+
+    if spec is None or spec.loader is None:
+        raise RuntimeError(
+            f"Impossible de charger le script : {path}"
+        )
+
+    module = importlib.util.module_from_spec(
+        spec
+    )
+
+    spec.loader.exec_module(module)
+
+    return module
+
+
+# ============================================================
+# ETAT DU JOB
+# ============================================================
+
+def write_state(
+    state_file: Path,
+    **values,
+):
+
+    state_file.parent.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+
+    current = {}
+
+    if state_file.exists():
+
+        try:
+
+            current = json.loads(
+                state_file.read_text(
+                    encoding="utf-8"
+                )
+            )
+
+        except Exception:
+
+            current = {}
+
+    current.update(values)
+
+    current["updated_at"] = time.time()
+
+    state_file.write_text(
+        json.dumps(
+            current,
+            ensure_ascii=False,
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
+
+
+# ============================================================
+# LIVRE — BOOKS TO SCRAPE
+# ============================================================
+
+def run_books(
+    root: Path,
+    pages: int,
+    state_file: Path,
+):
+
+    scraping_dir = (
+        root / "scraping"
+    )
+
+    books_script = (
+        scraping_dir / "books_scraper.py"
+    )
+
+    details_script = (
+        scraping_dir / "complete_books_details.py"
+    )
+
+    if not books_script.exists():
+
+        raise FileNotFoundError(
+            f"books_scraper.py introuvable : "
+            f"{books_script}"
+        )
+
+    # --------------------------------------------------------
+    # ETAT : DEMARRAGE
+    # --------------------------------------------------------
+
+    write_state(
+        state_file,
+        dataset="books",
+        status="running",
+        stage="catalogue",
+        pages=pages,
+        current_page=0,
+        total_pages=pages,
+        message=(
+            f"Collecte Books : "
+            f"{pages} page(s)"
+        ),
+    )
+
+    # --------------------------------------------------------
+    # CHARGEMENT DU MODULE
+    # --------------------------------------------------------
+
+    module = load_module(
+        books_script
+    )
+
+    # --------------------------------------------------------
+    # LIMITATION REELLE DES PAGES
+    # --------------------------------------------------------
+
+    module.START_PAGE = 1
+    module.END_PAGE = pages
+
+    # Certaines versions du scraper utilisent
+    # également ces variables.
+    if hasattr(
+        module,
+        "MAX_PAGES",
+    ):
+        module.MAX_PAGES = pages
+
+    if hasattr(
+        module,
+        "PAGES",
+    ):
+        module.PAGES = pages
+
+    # --------------------------------------------------------
+    # EXECUTION
+    # --------------------------------------------------------
+
+    if hasattr(
+        module,
+        "scrape_all_books",
+    ):
+
+        module.scrape_all_books(
+            1,
+            pages,
+        )
+
+    elif hasattr(
+        module,
+        "main",
+    ):
+
+        module.main()
+
+    else:
+
+        raise RuntimeError(
+            "books_scraper.py ne contient "
+            "ni scrape_all_books() ni main()."
+        )
+
+    # --------------------------------------------------------
+    # VERIFICATION DU CSV
+    # --------------------------------------------------------
+
+    books_file = (
+        root
+        / "data"
+        / "cleaned"
+        / "books_full.csv"
+    )
+
+    if not books_file.exists():
+
+        raise RuntimeError(
+            "Le scraper Books n'a pas produit "
+            "data/cleaned/books_full.csv."
+        )
+
+    # --------------------------------------------------------
+    # DETAILS DES LIVRES
+    # --------------------------------------------------------
+
+    if details_script.exists():
+
+        write_state(
+            state_file,
+            stage="details",
+            current_page=pages,
+            total_pages=pages,
+            message=(
+                "Récupération des détails "
+                "des livres..."
+            ),
+        )
+
+        env = os.environ.copy()
+
+        env["PYTHONIOENCODING"] = "utf-8"
+        env["PYTHONUTF8"] = "1"
+
+        result = subprocess.run(
+            [
+                sys.executable,
+                str(details_script),
+            ],
+            cwd=str(root),
+            env=env,
+        )
+
+        if result.returncode != 0:
+
+            raise RuntimeError(
+                "complete_books_details.py "
+                "a échoué."
+            )
+
+    # --------------------------------------------------------
+    # FIN
+    # --------------------------------------------------------
+
+    write_state(
+        state_file,
+        dataset="books",
+        status="completed",
+        stage="finished",
+        pages=pages,
+        current_page=pages,
+        total_pages=pages,
+        output=str(
+            books_file
+        ),
+        message=(
+            f"Books terminé : "
+            f"{pages} page(s)."
+        ),
+    )
+
+
+# ============================================================
+# GAARAAS
+# ============================================================
+
+def run_gaaraas(
+    root: Path,
+    pages: int,
+    state_file: Path,
+):
+
+    scraping_dir = (
+        root / "scraping"
+    )
+
+    # IMPORTANT :
+    # Utilisation du scraper complet.
+    # Ne pas utiliser le scraper RESUME.
+    gaaraas_script = (
+        scraping_dir
+        / "gaaraas_full_scraper.py"
+    )
+
+    if not gaaraas_script.exists():
+
+        raise FileNotFoundError(
+            f"gaaraas_full_scraper.py "
+            f"introuvable : {gaaraas_script}"
+        )
+
+    # --------------------------------------------------------
+    # ETAT : DEMARRAGE
+    # --------------------------------------------------------
+
+    write_state(
+        state_file,
+        dataset="gaaraas",
+        status="running",
+        stage="collection",
+        pages=pages,
+        current_page=0,
+        total_pages=pages,
+        message=(
+            f"Collecte Gaaraas : "
+            f"{pages} page(s)"
+        ),
+    )
+
+    # --------------------------------------------------------
+    # CHARGEMENT
+    # --------------------------------------------------------
+
+    module = load_module(
+        gaaraas_script
+    )
+
+    # --------------------------------------------------------
+    # LIMITATION REELLE DES PAGES
+    # --------------------------------------------------------
+
+    module.START_PAGE = 1
+    module.END_PAGE = pages
+
+    if hasattr(
+        module,
+        "MAX_PAGES",
+    ):
+        module.MAX_PAGES = pages
+
+    if hasattr(
+        module,
+        "PAGES",
+    ):
+        module.PAGES = pages
+
+    # --------------------------------------------------------
+    # EXECUTION
+    # --------------------------------------------------------
+
+    if hasattr(
+        module,
+        "scrape_all_gaaraas",
+    ):
+
+        module.scrape_all_gaaraas(
+            1,
+            pages,
+        )
+
+    elif hasattr(
+        module,
+        "scrape_all",
+    ):
+
+        module.scrape_all(
+            1,
+            pages,
+        )
+
+    elif hasattr(
+        module,
+        "main",
+    ):
+
+        module.main()
+
+    else:
+
+        raise RuntimeError(
+            "gaaraas_full_scraper.py ne contient "
+            "aucune fonction de lancement compatible."
+        )
+
+    # --------------------------------------------------------
+    # VERIFICATION DU RESULTAT
+    # --------------------------------------------------------
+
+    output = (
+        root
+        / "data"
+        / "cleaned"
+        / "gaaraas_full.csv"
+    )
+
+    if not output.exists():
+
+        raise RuntimeError(
+            "Le scraper Gaaraas n'a pas produit "
+            "data/cleaned/gaaraas_full.csv."
+        )
+
+    # --------------------------------------------------------
+    # FIN
+    # --------------------------------------------------------
+
+    write_state(
+        state_file,
+        dataset="gaaraas",
+        status="completed",
+        stage="finished",
+        pages=pages,
+        current_page=pages,
+        total_pages=pages,
+        output=str(output),
+        message=(
+            f"Gaaraas terminé : "
+            f"{pages} page(s)."
+        ),
+    )
+
+
+# ============================================================
+# MAIN
+# ============================================================
+
+def main():
+
+    if len(sys.argv) < 4:
+
+        print(
+            "Usage :"
+        )
+
+        print(
+            "python dataforge_scraper_runner.py "
+            "<books|gaaraas> <pages> <root>"
+        )
+
+        raise SystemExit(2)
+
+    dataset = (
+        sys.argv[1]
+        .strip()
+        .lower()
+    )
+
+    try:
+
+        pages = int(
+            sys.argv[2]
+        )
+
+    except ValueError:
+
+        raise ValueError(
+            "Le nombre de pages doit être un entier."
+        )
+
+    root = Path(
+        sys.argv[3]
+    ).resolve()
+
+    # --------------------------------------------------------
+    # VALIDATION
+    # --------------------------------------------------------
+
+    if pages < 1:
+
+        raise ValueError(
+            "Le nombre de pages doit être "
+            "supérieur ou égal à 1."
+        )
+
+    if dataset not in {
+        "books",
+        "gaaraas",
+    }:
+
+        raise ValueError(
+            "Dataset invalide. "
+            "Utiliser : books ou gaaraas."
+        )
+
+    # --------------------------------------------------------
+    # FICHIER D'ETAT
+    # --------------------------------------------------------
+
+    state_file = (
+        root
+        / "data"
+        / "temp"
+        / "dataforge_scraping_job.json"
+    )
+
+    # --------------------------------------------------------
+    # DEMARRAGE
+    # --------------------------------------------------------
+
+    write_state(
+        state_file,
+        dataset=dataset,
+        status="starting",
+        stage="initialisation",
+        pages=pages,
+        current_page=0,
+        total_pages=pages,
+        message=(
+            f"Démarrage du scraping "
+            f"{dataset} — "
+            f"{pages} page(s)."
+        ),
+    )
+
+    try:
+
+        # ----------------------------------------------------
+        # BOOKS
+        # ----------------------------------------------------
+
+        if dataset == "books":
+
+            run_books(
+                root=root,
+                pages=pages,
+                state_file=state_file,
+            )
+
+        # ----------------------------------------------------
+        # GAARAAS
+        # ----------------------------------------------------
+
+        elif dataset == "gaaraas":
+
+            run_gaaraas(
+                root=root,
+                pages=pages,
+                state_file=state_file,
+            )
+
+    except Exception as exc:
+
+        # ----------------------------------------------------
+        # ERREUR
+        # ----------------------------------------------------
+
+        write_state(
+            state_file,
+            dataset=dataset,
+            status="failed",
+            stage="error",
+            pages=pages,
+            current_page=0,
+            total_pages=pages,
+            error=str(exc),
+            message=(
+                f"Le scraping {dataset} "
+                "a échoué."
+            ),
+        )
+
+        raise
+
+
+# ============================================================
+# POINT D'ENTREE
+# ============================================================
+
+if __name__ == "__main__":
+
+    main()
