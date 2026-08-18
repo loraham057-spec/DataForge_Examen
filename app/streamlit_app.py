@@ -47,6 +47,12 @@ TEMP = ROOT / "data" / "temp"
 JOB_FILE = TEMP / "dataforge_scraping_job.json"
 RUNNER = ROOT / "scraper_runner.py"
 
+# Les modules internes sont à la racine du dépôt (ex. data_database.py).
+# Streamlit exécute ce fichier depuis app/, donc on ajoute explicitement
+# la racine du projet au PYTHONPATH.
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
 if str(APP_DIR) not in sys.path:
     sys.path.insert(0, str(APP_DIR))
 
